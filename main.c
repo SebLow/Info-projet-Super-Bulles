@@ -1,568 +1,304 @@
-
 #include <allegro.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
-#include /* ============================================================
-   SUPER BULLES - main.c
-   Point d'entrée, boucle principale, machine à états
+#include <string.h>
+#include "entities.h"
+#include "logique.h"
+#include "affichage.h"
+#include "ihm.h"
+
+/* ============================================================
+   ETATS DU JEU
    ============================================================ */
+typedef enum {
+    ETAT_MENU = 0,
+    ETAT_SAISIE_PSEUDO,
+    ETAT_COUNTDOWN,
+    ETAT_JEU,
+    ETAT_VICTOIRE_NIVEAU,
+    ETAT_DEFAITE_NIVEAU,
+    ETAT_VICTOIRE_PARTIE,
+    ETAT_GAME_OVER,
+    ETAT_QUITTER
+} EtatJeu;
 
-#include <allegro.h>
-#include <time.h>
-#include "game.h"
-#include "logic.h"
-#include "graphics.h"
-#include "ihm.h"
+/* ============================================================
+   TIMER FPS (callback Allegro)
+   ============================================================ */
+static volatile int tick = 0;
+static void incrementer_tick(void) { tick++; }
+END_OF_FUNCTION(incrementer_tick)
 
-/* Fréquence cible : 60 fps */
-#define TARGET_FPS 60
-
-/* Variable volatile pour le timer Allegro */
-static volatile int ticks = 0;
-static void ticker(void) { ticks++; }
-END_OF_FUNCTION(ticker)
-
-/* ------------------------------------------------------------------ */
-int main(void)
-{
-    srand((unsigned)time(NULL));
-
-    /* --- Initialisation Allegro --- */
-    allegro_init();
-    install_keyboard();
-    install_timer();
-
-    /* Résolution et mode graphique */
-    set_color_depth(32);
-    if (set_gfx_mode(GFX_AUTODETECT_WINDOWED, SCREEN_W, SCREEN_H, 0, 0) != 0) {
-        /* Fallback plein écran */
-        if (set_gfx_mode(GFX_AUTODETECT, SCREEN_W, SCREEN_H, 0, 0) != 0) {
-            allegro_message("Impossible d'initialiser le mode graphique : %s",
-                            allegro_error);
-            return 1;
-        }
-    }
-
-    set_window_title("Super Bulles - ECE 2025-2026");
-
-    /* Timer 60fps */
-    LOCK_VARIABLE(ticks);
-    LOCK_FUNCTION(ticker);
-    install_int_ex(ticker, BPS_TO_TIMER(TARGET_FPS));
-
-    /* Buffer hors-écran (double buffering) */
-    BITMAP *buf = create_bitmap(SCREEN_W, SCREEN_H);
-    if (!buf) {
-        allegro_message("Impossible de créer le buffer graphique.");
-        return 1;
-    }
-
-    /* Initialisation du rendu */
-    gfx_init();
-
-    /* --- État global du jeu --- */
-    GameData g;
-    memset(&g, 0, sizeof(g));
-    g.state = STATE_MENU;
-    logic_load_saves(&g);
-
-    /* Variables de navigation UI */
-    int menu_sel     = 0;
-    int load_sel     = 0;
-    char pseudo_buf[PSEUDO_LEN] = {0};
-    int  pseudo_cursor = 0;
-    char load_buf[PSEUDO_LEN]   = {0};
-    int  load_cursor = 0;
-    int  cursor_anim = 0;
-
-    InputState inp;
-    int prev_enter = 0, prev_esc = 0;
-    int prev_s = 0,  prev_q = 0;
-
-    /* ================================================================
-       BOUCLE PRINCIPALE
-       ================================================================ */
-    while (g.state != STATE_QUIT) {
-
-        /* --- Attendre le tick 60fps --- */
-        while (ticks == 0) { /* busy-wait léger */ }
-        ticks = 0;
-
-        /* --- Lecture des entrées --- */
-        ihm_read_keys(&inp);
-        cursor_anim++;
-
-        /* ============================================================
-           MACHINE A ETATS
-           ============================================================ */
-
-        switch (g.state) {
-
-        /* ---- MENU PRINCIPAL ---- */
-        case STATE_MENU: {
-            int confirmed = ihm_menu_navigate(&inp, &menu_sel, 4);
-            if (confirmed) {
-                switch (menu_sel) {
-                    case 0: g.state = STATE_RULES;    break;
-                    case 1:
-                        memset(pseudo_buf, 0, PSEUDO_LEN);
-                        pseudo_cursor = 0;
-                        g.state = STATE_PSEUDO;
-                        break;
-                    case 2:
-                        memset(load_buf, 0, PSEUDO_LEN);
-                        load_cursor = 0;
-                        load_sel = 0;
-                        g.state = STATE_LOAD_GAME;
-                        break;
-                    case 3: g.state = STATE_QUIT; break;
-                }
-            }
-            break;
-        }
-
-        /* ---- RÈGLES ---- */
-        case STATE_RULES: {
-            int ce = (inp.enter && !prev_enter);
-            int ce2 = (inp.escape && !prev_esc);
-            if (ce || ce2) g.state = STATE_MENU;
-            break;
-        }
-
-        /* ---- SAISIE PSEUDO (nouvelle partie) ---- */
-        case STATE_PSEUDO: {
-            int done = ihm_text_input(&inp, pseudo_buf, PSEUDO_LEN, &pseudo_cursor);
-            if (inp.escape && !prev_esc) { g.state = STATE_MENU; break; }
-            if (done && strlen(pseudo_buf) > 0) {
-                logic_init_game(&g, pseudo_buf);
-                logic_init_level(&g, 1);
-            }
-            break;
-        }
-
-        /* ---- CHARGEMENT PARTIE ---- */
-        case STATE_LOAD_GAME: {
-            /* Saisie pseudo */
-            ihm_text_input(&inp, load_buf, PSEUDO_LEN, &load_cursor);
-            /* Navigation dans la liste */
-            static int prev_up2 = 0, prev_dn2 = 0;
-            if (inp.up && !prev_up2 && load_sel > 0) load_sel--;
-            if (inp.down && !prev_dn2 && load_sel < g.nb_saves - 1) load_sel++;
-            prev_up2 = inp.up; prev_dn2 = inp.down;
-
-            if (inp.escape && !prev_esc) { g.state = STATE_MENU; break; }
-            if (inp.enter && !prev_enter) {
-                /* Cherche par pseudo tapé, sinon par sélection liste */
-                int idx = -1;
-                if (strlen(load_buf) > 0) idx = logic_find_save(&g, load_buf);
-                if (idx == -1 && g.nb_saves > 0) idx = load_sel;
-                if (idx >= 0) {
-                    strncpy(g.player.pseudo, g.saves[idx].pseudo, PSEUDO_LEN-1);
-                    g.score = g.saves[idx].score;
-                    g.player.alive = 1;
-                    logic_init_level(&g, g.saves[idx].level);
-                }
-                else g.state = STATE_MENU;
-            }
-            break;
-        }
-
-        /* ---- COMPTE À REBOURS ---- */
-        case STATE_COUNTDOWN: {
-            logic_update(&g, 0, 0, 0, 1.0f/TARGET_FPS);
-            break;
-        }
-
-        /* ---- JEU EN COURS ---- */
-        case STATE_PLAY: {
-            logic_update(&g, inp.left, inp.right, inp.shoot,
-                         1.0f / TARGET_FPS);
-            /* Pause/menu */
-            if (inp.escape && !prev_esc) {
-                logic_save(&g);
-                g.state = STATE_MENU;
-            }
-            break;
-        }
-
-        /* ---- VICTOIRE NIVEAU ---- */
-        case STATE_LEVEL_WIN: {
-            int ce = (inp.enter && !prev_enter);
-            int cs = (key[KEY_S]   && !prev_s);
-            int cq = (key[KEY_Q]   && !prev_q);
-            int ce2= (inp.escape   && !prev_esc);
-            if (cs) logic_save(&g);
-            if (ce) {
-                /* Niveau suivant */
-                logic_init_level(&g, g.current_level + 1);
-            }
-            if (ce2) g.state = STATE_MENU;
-            if (cq)  g.state = STATE_QUIT;
-            break;
-        }
-
-        /* ---- ECHEC NIVEAU ---- */
-        case STATE_LEVEL_LOSE: {
-            int ce = (inp.enter && !prev_enter);
-            int cs = (key[KEY_S]   && !prev_s);
-            int cq = (key[KEY_Q]   && !prev_q);
-            int ce2= (inp.escape   && !prev_esc);
-            if (cs) logic_save(&g);
-            if (ce) {
-                /* Recommencer le même niveau */
-                logic_init_level(&g, g.current_level);
-            }
-            if (ce2) g.state = STATE_MENU;
-            if (cq)  g.state = STATE_QUIT;
-            break;
-        }
-
-        /* ---- VICTOIRE FINALE ---- */
-        case STATE_GAME_WIN: {
-            int ce = (inp.enter && !prev_enter);
-            if (ce) g.state = STATE_MENU;
-            break;
-        }
-
-        /* ---- GAME OVER (alias lose au dernier niveau) ---- */
-        case STATE_GAME_OVER: {
-            int ce = (inp.enter && !prev_enter);
-            if (ce) g.state = STATE_MENU;
-            break;
-        }
-
-        default: break;
-        }
-
-        /* --- Mémorisation état précédent des touches spéciales --- */
-        prev_enter = inp.enter;
-        prev_esc   = inp.escape;
-        prev_s     = key[KEY_S];
-        prev_q     = key[KEY_Q];
-
-        /* ============================================================
-           RENDU
-           ============================================================ */
-        clear_to_color(buf, 0);
-
-        switch (g.state) {
-            case STATE_MENU:
-                gfx_draw_menu(buf, menu_sel);
-                break;
-            case STATE_RULES:
-                gfx_draw_rules(buf);
-                break;
-            case STATE_PSEUDO:
-                gfx_draw_pseudo_input(buf, pseudo_buf, cursor_anim);
-                break;
-            case STATE_LOAD_GAME:
-                gfx_draw_load_screen(buf, &g, load_sel, load_buf, cursor_anim);
-                break;
-            case STATE_COUNTDOWN:
-                gfx_draw_countdown(buf, &g);
-                break;
-            case STATE_PLAY:
-                gfx_draw_game(buf, &g);
-                break;
-            case STATE_LEVEL_WIN:
-                gfx_draw_level_result(buf, &g, 1);
-                break;
-            case STATE_LEVEL_LOSE:
-                gfx_draw_level_result(buf, &g, 0);
-                break;
-            case STATE_GAME_WIN:
-                gfx_draw_game_win(buf, &g);
-                break;
-            default:
-                break;
-        }
-
-        /* Flip buffer */
-        blit(buf, screen, 0, 0, 0, 0, SCREEN_W, SCREEN_H);
-    }
-
-    /* --- Nettoyage --- */
-    destroy_bitmap(buf);
-    gfx_destroy();
-    allegro_exit();
-    return 0;
+/* ============================================================
+   REGLES DU JEU
+   ============================================================ */
+static void afficher_regles(void) {
+    clear_to_color(buffer, makecol(5, 5, 20));
+    int y = 30;
+    textout_centre_ex(buffer, font, "=== REGLES DU JEU ===",
+                      JEU_LARG/2, y, makecol(255,230,50), -1); y+=30;
+    textout_ex(buffer, font,
+        "- Detruisez tous les asteroides de chaque niveau.",
+        20, y, makecol(255,255,255), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Fleches : deplacer le Faucon Millenium.",
+        20, y, makecol(255,255,255), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Espace : tirer.",
+        20, y, makecol(255,255,255), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Une bulle touchee se divise en bulles plus petites.",
+        20, y, makecol(255,255,255), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Ne pas toucher les asteroides ni les eclairs !",
+        20, y, makecol(220,40,40), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Niveau 3 : des eclairs tombent des asteroides.",
+        20, y, makecol(255,230,50), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Niveau 4 : affrontez le Destroyer Stellaire !",
+        20, y, makecol(220,40,40), -1); y+=20;
+    textout_ex(buffer, font,
+        "- Recuperez les bonus (L=laser, B=bombe, S=bouclier).",
+        20, y, makecol(60,220,80), -1); y+=30;
+    textout_centre_ex(buffer, font, "Appuyez sur une touche pour revenir...",
+                      JEU_LARG/2, y+20, makecol(150,150,150), -1);
+    affichage_flip();
+    ihm_attendre_touche();
 }
-END_OF_MAIN()
-"game.h"
-#include "logic.h"
-#include "graphics.h"
-#include "ihm.h"
 
-/* Fréquence cible : 60 fps */
-#define TARGET_FPS 60
-
-/* Variable volatile pour le timer Allegro */
-static volatile int ticks = 0;
-static void ticker(void) { ticks++; }
-END_OF_FUNCTION(ticker)
-
-/* ------------------------------------------------------------------ */
-int main(void)
-{
+/* ============================================================
+   BOUCLE PRINCIPALE
+   ============================================================ */
+int main(void) {
     srand((unsigned)time(NULL));
 
-    /* --- Initialisation Allegro --- */
-    allegro_init();
-    install_keyboard();
-    install_timer();
-
-    /* Résolution et mode graphique */
-    set_color_depth(32);
-    if (set_gfx_mode(GFX_AUTODETECT_WINDOWED, SCREEN_W, SCREEN_H, 0, 0) != 0) {
-        /* Fallback plein écran */
-        if (set_gfx_mode(GFX_AUTODETECT, SCREEN_W, SCREEN_H, 0, 0) != 0) {
-            allegro_message("Impossible d'initialiser le mode graphique : %s",
-                            allegro_error);
-            return 1;
-        }
-    }
-
-    set_window_title("Super Bulles - ECE 2025-2026");
-
-    /* Timer 60fps */
-    LOCK_VARIABLE(ticks);
-    LOCK_FUNCTION(ticker);
-    install_int_ex(ticker, BPS_TO_TIMER(TARGET_FPS));
-
-    /* Buffer hors-écran (double buffering) */
-    BITMAP *buf = create_bitmap(SCREEN_W, SCREEN_H);
-    if (!buf) {
-        allegro_message("Impossible de créer le buffer graphique.");
+    if (!affichage_init()) {
+        allegro_message("Erreur initialisation graphique !");
         return 1;
     }
 
-    /* Initialisation du rendu */
-    gfx_init();
+    /* Timer FPS */
+    LOCK_FUNCTION(incrementer_tick);
+    LOCK_VARIABLE(tick);
+    install_int_ex(incrementer_tick, BPS_TO_TIMER(FPS));
 
-    /* --- État global du jeu --- */
-    GameData g;
-    memset(&g, 0, sizeof(g));
-    g.state = STATE_MENU;
-    logic_load_saves(&g);
+    /* Variables de jeu */
+    EtatJeu  etat        = ETAT_MENU;
+    int      selection   = 1;   /* 0=regles,1=nouvelle,2=reprendre,3=quitter */
+    int      score_total = 0;
+    int      niveau_num  = 1;
+    int      countdown   = 3 * FPS;  /* 3 secondes en ticks */
+    int      delay_menu  = 0;   /* anti-rebond apres ecran */
+    int      score_sauve = 0;
 
-    /* Variables de navigation UI */
-    int menu_sel     = 0;
-    int load_sel     = 0;
-    char pseudo_buf[PSEUDO_LEN] = {0};
-    int  pseudo_cursor = 0;
-    char load_buf[PSEUDO_LEN]   = {0};
-    int  load_cursor = 0;
-    int  cursor_anim = 0;
+    Joueur j;
+    memset(&j, 0, sizeof(j));
+    strcpy(j.pseudo, "PILOTE");
 
-    InputState inp;
-    int prev_enter = 0, prev_esc = 0;
-    int prev_s = 0,  prev_q = 0;
+    Niveau n;
+    memset(&n, 0, sizeof(n));
 
-    /* ================================================================
-       BOUCLE PRINCIPALE
-       ================================================================ */
-    while (g.state != STATE_QUIT) {
+    /* Pseudo buffer */
+    char   pseudo_buf[PSEUDO_MAX] = {0};
+    int    pseudo_len = 0;
+    int    reprendre  = 0;  /* 1 si mode reprise */
 
-        /* --- Attendre le tick 60fps --- */
-        while (ticks == 0) { /* busy-wait léger */ }
-        ticks = 0;
+    while (etat != ETAT_QUITTER) {
+        /* Attendre le prochain tick */
+        while (!tick) { /* busy-wait leger */ }
+        tick = 0;
 
-        /* --- Lecture des entrées --- */
-        ihm_read_keys(&inp);
-        cursor_anim++;
+        switch (etat) {
 
-        /* ============================================================
-           MACHINE A ETATS
-           ============================================================ */
+        /* -------------------------------------------------- */
+        case ETAT_MENU:
+            ecran_menu(buffer, selection);
+            affichage_flip();
 
-        switch (g.state) {
+            if (delay_menu > 0) { delay_menu--; break; }
 
-        /* ---- MENU PRINCIPAL ---- */
-        case STATE_MENU: {
-            int confirmed = ihm_menu_navigate(&inp, &menu_sel, 4);
-            if (confirmed) {
-                switch (menu_sel) {
-                    case 0: g.state = STATE_RULES;    break;
+            if (ihm_menu_haut() && selection > 0) { selection--; rest(120); }
+            if (ihm_menu_bas()  && selection < 3) { selection++; rest(120); }
+            if (ihm_valider()) {
+                switch (selection) {
+                    case 0: afficher_regles(); break;
                     case 1:
-                        memset(pseudo_buf, 0, PSEUDO_LEN);
-                        pseudo_cursor = 0;
-                        g.state = STATE_PSEUDO;
+                        reprendre = 0;
+                        memset(pseudo_buf, 0, PSEUDO_MAX);
+                        pseudo_len = 0;
+                        etat = ETAT_SAISIE_PSEUDO;
                         break;
                     case 2:
-                        memset(load_buf, 0, PSEUDO_LEN);
-                        load_cursor = 0;
-                        load_sel = 0;
-                        g.state = STATE_LOAD_GAME;
+                        reprendre = 1;
+                        memset(pseudo_buf, 0, PSEUDO_MAX);
+                        pseudo_len = 0;
+                        etat = ETAT_SAISIE_PSEUDO;
                         break;
-                    case 3: g.state = STATE_QUIT; break;
+                    case 3:
+                        etat = ETAT_QUITTER;
+                        break;
+                }
+                rest(200);
+            }
+            break;
+
+        /* -------------------------------------------------- */
+        case ETAT_SAISIE_PSEUDO:
+            ecran_saisie_pseudo(buffer, pseudo_buf, pseudo_len);
+            affichage_flip();
+
+            if (ihm_saisie_pseudo(pseudo_buf, &pseudo_len, PSEUDO_MAX)) {
+                strncpy(j.pseudo, pseudo_buf, PSEUDO_MAX-1);
+                if (reprendre) {
+                    Sauvegarde sv;
+                    if (sauvegarde_lire(j.pseudo, &sv)) {
+                        niveau_num  = sv.dernier_niveau;
+                        score_total = sv.score;
+                    } else {
+                        niveau_num  = 1;
+                        score_total = 0;
+                    }
+                } else {
+                    niveau_num  = 1;
+                    score_total = 0;
+                }
+                niveau_init(&n, niveau_num, &j);
+                countdown = 3 * FPS;
+                etat = ETAT_COUNTDOWN;
+            }
+            break;
+
+        /* -------------------------------------------------- */
+        case ETAT_COUNTDOWN:
+            dessiner_fond(niveau_num);
+            dessiner_joueur(buffer, &j);
+            ecran_countdown(buffer, countdown / FPS + 1);
+            affichage_flip();
+            countdown--;
+            if (countdown <= 0) etat = ETAT_JEU;
+            break;
+
+        /* -------------------------------------------------- */
+        case ETAT_JEU: {
+            /* Entrees */
+            int dir = ihm_direction();
+            joueur_deplacer(&j, dir, JEU_LARG);
+
+            if (ihm_tir()) {
+                /* Arme de base : un seul projectile a la fois */
+                if (j.arme_active == ARME_BASE) {
+                    if (n.liste_projectiles == NULL) {
+                        Projectile *p = joueur_tirer(&j);
+                        if (p) { p->suivant = n.liste_projectiles;
+                                 n.liste_projectiles = p; }
+                    }
+                } else {
+                    /* Armes evoluees : tir libre */
+                    Projectile *p = joueur_tirer(&j);
+                    if (p) { p->suivant = n.liste_projectiles;
+                             n.liste_projectiles = p; }
                 }
             }
-            break;
-        }
 
-        /* ---- RÈGLES ---- */
-        case STATE_RULES: {
-            int ce = (inp.enter && !prev_enter);
-            int ce2 = (inp.escape && !prev_esc);
-            if (ce || ce2) g.state = STATE_MENU;
-            break;
-        }
+            /* Logique */
+            niveau_update(&n, &j);
 
-        /* ---- SAISIE PSEUDO (nouvelle partie) ---- */
-        case STATE_PSEUDO: {
-            int done = ihm_text_input(&inp, pseudo_buf, PSEUDO_LEN, &pseudo_cursor);
-            if (inp.escape && !prev_esc) { g.state = STATE_MENU; break; }
-            if (done && strlen(pseudo_buf) > 0) {
-                logic_init_game(&g, pseudo_buf);
-                logic_init_level(&g, 1);
+            /* Dessin */
+            dessiner_fond(niveau_num);
+            dessiner_asteroides(buffer, n.liste_asteroides);
+            dessiner_projectiles(buffer, n.liste_projectiles);
+            dessiner_bonus(buffer, n.liste_bonus);
+            dessiner_eclairs(buffer, n.liste_eclairs);
+            if (n.boss_actif) dessiner_boss(buffer, &n.boss);
+            dessiner_joueur(buffer, &j);
+            dessiner_hud(buffer, &j, n.temps_restant,
+                         score_total + n.score_courant, niveau_num);
+            affichage_flip();
+
+            /* Transitions */
+            if (niveau_gagne(&n)) {
+                score_total += n.score_courant;
+                niveau_vider(&n);
+                etat = ETAT_VICTOIRE_NIVEAU;
+                delay_menu = FPS;
+            } else if (niveau_perdu(&n, &j)) {
+                niveau_vider(&n);
+                etat = ETAT_DEFAITE_NIVEAU;
+                delay_menu = FPS;
+            }
+            if (ihm_quitter_jeu()) {
+                niveau_vider(&n);
+                etat = ETAT_MENU;
+                delay_menu = FPS / 2;
             }
             break;
         }
 
-        /* ---- CHARGEMENT PARTIE ---- */
-        case STATE_LOAD_GAME: {
-            /* Saisie pseudo */
-            ihm_text_input(&inp, load_buf, PSEUDO_LEN, &load_cursor);
-            /* Navigation dans la liste */
-            static int prev_up2 = 0, prev_dn2 = 0;
-            if (inp.up && !prev_up2 && load_sel > 0) load_sel--;
-            if (inp.down && !prev_dn2 && load_sel < g.nb_saves - 1) load_sel++;
-            prev_up2 = inp.up; prev_dn2 = inp.down;
+        /* -------------------------------------------------- */
+        case ETAT_VICTOIRE_NIVEAU:
+            if (delay_menu > 0) { delay_menu--; break; }
+            ecran_victoire(buffer, score_total);
+            affichage_flip();
+            ihm_attendre_touche();
 
-            if (inp.escape && !prev_esc) { g.state = STATE_MENU; break; }
-            if (inp.enter && !prev_enter) {
-                /* Cherche par pseudo tapé, sinon par sélection liste */
-                int idx = -1;
-                if (strlen(load_buf) > 0) idx = logic_find_save(&g, load_buf);
-                if (idx == -1 && g.nb_saves > 0) idx = load_sel;
-                if (idx >= 0) {
-                    strncpy(g.player.pseudo, g.saves[idx].pseudo, PSEUDO_LEN-1);
-                    g.score = g.saves[idx].score;
-                    g.player.alive = 1;
-                    logic_init_level(&g, g.saves[idx].level);
-                }
-                else g.state = STATE_MENU;
+            if (niveau_num < 4) {
+                niveau_num++;
+                niveau_init(&n, niveau_num, &j);
+                countdown = 3 * FPS;
+                etat = ETAT_COUNTDOWN;
+            } else {
+                /* Partie gagnee ! */
+                etat = ETAT_VICTOIRE_PARTIE;
             }
             break;
-        }
 
-        /* ---- COMPTE À REBOURS ---- */
-        case STATE_COUNTDOWN: {
-            logic_update(&g, 0, 0, 0, 1.0f/TARGET_FPS);
+        /* -------------------------------------------------- */
+        case ETAT_DEFAITE_NIVEAU:
+            if (delay_menu > 0) { delay_menu--; break; }
+            ecran_defaite(buffer);
+            affichage_flip();
+            ihm_attendre_touche();
+            /* Sauvegarder et proposer menu */
+            sauvegarde_ecrire(j.pseudo, niveau_num, score_total);
+            etat = ETAT_MENU;
+            delay_menu = FPS / 2;
             break;
-        }
 
-        /* ---- JEU EN COURS ---- */
-        case STATE_PLAY: {
-            logic_update(&g, inp.left, inp.right, inp.shoot,
-                         1.0f / TARGET_FPS);
-            /* Pause/menu */
-            if (inp.escape && !prev_esc) {
-                logic_save(&g);
-                g.state = STATE_MENU;
+        /* -------------------------------------------------- */
+        case ETAT_VICTOIRE_PARTIE:
+            clear_to_color(buffer, makecol(0, 0, 0));
+            textout_centre_ex(buffer, font,
+                "*** VICTOIRE ! LA GALAXIE EST SAUVEE ! ***",
+                JEU_LARG/2, 180, makecol(255,230,50), -1);
+            {
+                char txt[64];
+                sprintf(txt, "Score final : %d", score_total);
+                textout_centre_ex(buffer, font, txt,
+                    JEU_LARG/2, 220, makecol(60,220,80), -1);
             }
+            textout_centre_ex(buffer, font,
+                "Appuyez sur une touche...",
+                JEU_LARG/2, 270, makecol(200,200,200), -1);
+            affichage_flip();
+            ihm_attendre_touche();
+            sauvegarde_ecrire(j.pseudo, 4, score_total);
+            score_sauve = score_total;
+            (void)score_sauve;
+            etat = ETAT_MENU;
+            delay_menu = FPS / 2;
+            niveau_num = 1;
+            score_total = 0;
+            break;
+
+        /* -------------------------------------------------- */
+        default:
             break;
         }
-
-        /* ---- VICTOIRE NIVEAU ---- */
-        case STATE_LEVEL_WIN: {
-            int ce = (inp.enter && !prev_enter);
-            int cs = (key[KEY_S]   && !prev_s);
-            int cq = (key[KEY_Q]   && !prev_q);
-            int ce2= (inp.escape   && !prev_esc);
-            if (cs) logic_save(&g);
-            if (ce) {
-                /* Niveau suivant */
-                logic_init_level(&g, g.current_level + 1);
-            }
-            if (ce2) g.state = STATE_MENU;
-            if (cq)  g.state = STATE_QUIT;
-            break;
-        }
-
-        /* ---- ECHEC NIVEAU ---- */
-        case STATE_LEVEL_LOSE: {
-            int ce = (inp.enter && !prev_enter);
-            int cs = (key[KEY_S]   && !prev_s);
-            int cq = (key[KEY_Q]   && !prev_q);
-            int ce2= (inp.escape   && !prev_esc);
-            if (cs) logic_save(&g);
-            if (ce) {
-                /* Recommencer le même niveau */
-                logic_init_level(&g, g.current_level);
-            }
-            if (ce2) g.state = STATE_MENU;
-            if (cq)  g.state = STATE_QUIT;
-            break;
-        }
-
-        /* ---- VICTOIRE FINALE ---- */
-        case STATE_GAME_WIN: {
-            int ce = (inp.enter && !prev_enter);
-            if (ce) g.state = STATE_MENU;
-            break;
-        }
-
-        /* ---- GAME OVER (alias lose au dernier niveau) ---- */
-        case STATE_GAME_OVER: {
-            int ce = (inp.enter && !prev_enter);
-            if (ce) g.state = STATE_MENU;
-            break;
-        }
-
-        default: break;
-        }
-
-        /* --- Mémorisation état précédent des touches spéciales --- */
-        prev_enter = inp.enter;
-        prev_esc   = inp.escape;
-        prev_s     = key[KEY_S];
-        prev_q     = key[KEY_Q];
-
-        /* ============================================================
-           RENDU
-           ============================================================ */
-        clear_to_color(buf, 0);
-
-        switch (g.state) {
-            case STATE_MENU:
-                gfx_draw_menu(buf, menu_sel);
-                break;
-            case STATE_RULES:
-                gfx_draw_rules(buf);
-                break;
-            case STATE_PSEUDO:
-                gfx_draw_pseudo_input(buf, pseudo_buf, cursor_anim);
-                break;
-            case STATE_LOAD_GAME:
-                gfx_draw_load_screen(buf, &g, load_sel, load_buf, cursor_anim);
-                break;
-            case STATE_COUNTDOWN:
-                gfx_draw_countdown(buf, &g);
-                break;
-            case STATE_PLAY:
-                gfx_draw_game(buf, &g);
-                break;
-            case STATE_LEVEL_WIN:
-                gfx_draw_level_result(buf, &g, 1);
-                break;
-            case STATE_LEVEL_LOSE:
-                gfx_draw_level_result(buf, &g, 0);
-                break;
-            case STATE_GAME_WIN:
-                gfx_draw_game_win(buf, &g);
-                break;
-            default:
-                break;
-        }
-
-        /* Flip buffer */
-        blit(buf, screen, 0, 0, 0, 0, SCREEN_W, SCREEN_H);
     }
 
-    /* --- Nettoyage --- */
-    destroy_bitmap(buf);
-    gfx_destroy();
-    allegro_exit();
+    affichage_quitter();
     return 0;
 }
 END_OF_MAIN()
