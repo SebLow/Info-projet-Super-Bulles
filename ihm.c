@@ -1,58 +1,63 @@
-/* ============================================================
-   SUPER BULLES - ihm.c
-   Gestion des entrées clavier (découplée de la logique)
-   ============================================================ */
-
-#include "ihm.h"
 #include <allegro.h>
-#include<main.h>
+#include <string.h>
+#include "ihm.h"
 
-void ihm_read_keys(InputState *inp)
-{
-    inp->left    = key[KEY_LEFT];
-    inp->right   = key[KEY_RIGHT];
-    inp->up      = key[KEY_UP];
-    inp->down    = key[KEY_DOWN];
-    inp->shoot   = key[KEY_SPACE];
-    inp->enter   = key[KEY_ENTER];
-    inp->escape  = key[KEY_ESC];
-    inp->last_char = 0;
+int tir_pret = 1;
+
+int ihm_direction(void) {
+    if (key[KEY_LEFT])  return -1;
+    if (key[KEY_RIGHT]) return  1;
+    return 0;
 }
 
-int ihm_menu_navigate(InputState *inp, int *selection, int nb_items)
-{
-    /* Retourne 1 si Enter enfoncé */
-    static int prev_up = 0, prev_down = 0, prev_enter = 0;
-
-    if (inp->up && !prev_up) {
-        (*selection)--;
-        if (*selection < 0) *selection = nb_items - 1;
+int ihm_tir(void) {
+    if (key[KEY_SPACE]) {
+        if (tir_pret) { tir_pret = 0; return 1; }
+        return 0;
     }
-    if (inp->down && !prev_down) {
-        (*selection)++;
-        if (*selection >= nb_items) *selection = 0;
-    }
-    int confirmed = (inp->enter && !prev_enter);
-    prev_up    = inp->up;
-    prev_down  = inp->down;
-    prev_enter = inp->enter;
-    return confirmed;
+    tir_pret = 1;
+    return 0;
 }
 
-int ihm_text_input(InputState *inp, char *buf, int maxlen, int *cursor)
-{
-    /* Lecture de l'entrée clavier pour saisie texte */
-    /* Retourne 1 si Enter validé */
+int ihm_menu_haut(void)  { return key[KEY_UP]; }
+int ihm_menu_bas(void)   { return key[KEY_DOWN]; }
+int ihm_valider(void)    { return key[KEY_ENTER]; }
+int ihm_quitter_jeu(void){ return key[KEY_ESC]; }
+
+int ihm_saisie_pseudo(char *buf, int *len, int max_len) {
+    /* Parcourt les touches ASCII */
     int c;
-    (void)inp;
-    while ((c = ureadkey(NULL)) != 0) {
-        if (c == KEY_ENTER || c == '\r' || c == '\n') return 1;
-        if (c == KEY_BACKSPACE || c == 8) {
-            if (*cursor > 0) { (*cursor)--; buf[*cursor] = '\0'; }
-        } else if (c >= 32 && c < 127 && *cursor < maxlen - 1) {
-            buf[(*cursor)++] = (char)c;
-            buf[*cursor] = '\0';
+    for (c = KEY_A; c <= KEY_Z; c++) {
+        if (key[c]) {
+            if (*len < max_len - 1) {
+                buf[(*len)++] = 'A' + (c - KEY_A);
+                buf[*len]     = '\0';
+            }
+            clear_keybuf();
+            return 0;
         }
     }
+    for (c = KEY_0; c <= KEY_9; c++) {
+        if (key[c]) {
+            if (*len < max_len - 1) {
+                buf[(*len)++] = '0' + (c - KEY_0);
+                buf[*len]     = '\0';
+            }
+            clear_keybuf();
+            return 0;
+        }
+    }
+    if (key[KEY_BACKSPACE] && *len > 0) {
+        buf[--(*len)] = '\0';
+        clear_keybuf();
+        return 0;
+    }
+    if (key[KEY_ENTER] && *len > 0) return 1;
     return 0;
+}
+
+void ihm_attendre_touche(void) {
+    clear_keybuf();
+    while (!keypressed()) { /* attente */ }
+    clear_keybuf();
 }
