@@ -1,505 +1,589 @@
-/* ============================================================
-   SUPER BULLES - logic.c
-   Logique métier pure (sans aucune dépendance Allegro)
-   ============================================================ */
-
-#include "logic.h"
+#include <stdlib.h>
 #include <math.h>
-#include<main.h>
+#include <stdio.h>
+#include <string.h>
+#include "logique.h"
 
-#define SAVE_FILE "saves.txt"
+/* ============================================================
+   JOUEUR
+   ============================================================ */
+void joueur_init(Joueur *j, const char *pseudo) {
+    j->x          = JEU_LARG / 2 - 20;
+    j->y          = ZONE_JEU_H - 60;
+    j->vx         = 0;
+    j->largeur    = 40;
+    j->hauteur    = 30;
+    j->arme_active = ARME_BASE;
+    j->duree_arme  = 0;
+    j->vivant      = 1;
+    j->bouclier    = 0;
+    strncpy(j->pseudo, pseudo, PSEUDO_MAX - 1);
+    j->pseudo[PSEUDO_MAX - 1] = '\0';
+}
 
-/* ------------------------------------------------------------------ */
-/* Helpers internes                                                     */
-/* ------------------------------------------------------------------ */
+void joueur_deplacer(Joueur *j, int dir, int zone_w) {
+    int vitesse = 5;
+    j->x += dir * vitesse;
+    if (j->x < 0)              j->x = 0;
+    if (j->x + j->largeur > zone_w) j->x = zone_w - j->largeur;
+}
 
-static FoodType food_for_level(int level, int idx)
-{
-    switch (level) {
-        case 1: return FOOD_COOKIE;
-        case 2: return FOOD_PIZZA;
-        case 3: return FOOD_BURGER;
-        case 4: return (FoodType)(idx % 3); /* cookie/pizza/burger */
-        case 5: return FOOD_CAKE;
-        default: return FOOD_COOKIE;
+/* ============================================================
+   PROJECTILES
+   ============================================================ */
+Projectile* projectile_creer(float x, float y, int type) {
+    Projectile *p = (Projectile*)malloc(sizeof(Projectile));
+    if (!p) return NULL;
+    p->x      = x;
+    p->y      = y;
+    p->vy     = -12;
+    p->actif  = 1;
+    p->type   = type;
+    p->suivant = NULL;
+    return p;
+}
+
+void projectiles_update(Projectile **liste) {
+    Projectile *p = *liste, *prev = NULL;
+    while (p) {
+        p->y += p->vy;
+        if (p->y < 0 || !p->actif) {
+            /* Supprimer ce noeud */
+            Projectile *suivant = p->suivant;
+            if (prev) prev->suivant = suivant;
+            else       *liste       = suivant;
+            free(p);
+            p = suivant;
+        } else {
+            prev = p;
+            p    = p->suivant;
+        }
     }
 }
 
-static int radius_for_level(int lv)
-{
-    if (lv == 0) return BUBBLE_R_BIG;
-    if (lv == 1) return BUBBLE_R_MED;
-    return BUBBLE_R_SMALL;
+void projectiles_vider(Projectile **liste) {
+    Projectile *p = *liste;
+    while (p) {
+        Projectile *tmp = p->suivant;
+        free(p);
+        p = tmp;
+    }
+    *liste = NULL;
 }
 
-static float rand_float(float lo, float hi)
-{
-    return lo + ((float)rand() / RAND_MAX) * (hi - lo);
+Projectile* joueur_tirer(Joueur *j) {
+    float cx = j->x + j->largeur / 2.0f - 2;
+    float cy = j->y;
+    return projectile_creer(cx, cy, j->arme_active);
 }
 
-/* Ajoute une bulle dans le tableau */
-static void add_bubble(GameData *g, float x, float y,
-                       float vx, float vy,
-                       int lv, FoodType food)
-{
-    int i;
-    if (g->nb_bubbles >= MAX_BUBBLES) return;
-    for (i = 0; i < MAX_BUBBLES; i++) {
-        if (!g->bubbles[i].alive) {
-            Bubble *b = &g->bubbles[i];
-            b->x = x; b->y = y;
-            b->vx = vx; b->vy = vy;
-            b->level = lv;
-            b->radius = radius_for_level(lv);
-            b->alive = 1;
-            b->food = food;
-            b->shoots_lightning = 0;
-            b->lightning_timer = 0;
-            b->hits_needed = (food == FOOD_CAKE) ? 1 : 1;
-            g->nb_bubbles++;
-            return;
-        }
-    }
+/* ============================================================
+   ASTEROIDES
+   ============================================================ */
+Asteroide* asteroide_creer(float x, float y, float vx, float vy,
+                            int rayon, int niveau_div,
+                            int lance_eclair, int bonus_cache) {
+    Asteroide *a = (Asteroide*)malloc(sizeof(Asteroide));
+    if (!a) return NULL;
+    a->x           = x;
+    a->y           = y;
+    a->vx          = vx;
+    a->vy          = vy;
+    a->rayon       = rayon;
+    a->niveau_div  = niveau_div;
+    a->lance_eclair = lance_eclair;
+    a->timer_eclair = 120 + rand() % 180;
+    a->bonus_cache  = bonus_cache;
+    a->suivant      = NULL;
+    return a;
 }
 
-/* ------------------------------------------------------------------ */
-/* Initialisation                                                       */
-/* ------------------------------------------------------------------ */
-
-void logic_init_game(GameData *g, const char *pseudo)
-{
-    int i;
-    memset(g, 0, sizeof(GameData));
-    strncpy(g->player.pseudo, pseudo, PSEUDO_LEN - 1);
-    g->player.alive = 1;
-    g->player.weapon = WEAPON_BASIC;
-    g->state = STATE_COUNTDOWN;
-    g->current_level = 1;
-    g->score = 0;
-    for (i = 0; i < MAX_SAVES; i++) g->saves[i].level = 0;
-}
-
-void logic_init_level(GameData *g, int level)
-{
-    int i;
-    float cx, cy;
-
-    /* Reset bulles, projectiles, armes */
-    memset(g->bubbles, 0, sizeof(g->bubbles));
-    memset(g->projs,   0, sizeof(g->projs));
-    memset(g->weapons, 0, sizeof(g->weapons));
-    memset(g->lightnings, 0, sizeof(g->lightnings));
-    g->nb_bubbles = 0;
-
-    /* Joueur au centre bas */
-    g->player.x = PLAY_W / 2.0f - PLAYER_W / 2.0f;
-    g->player.y = PLAY_BOT - PLAYER_H - 2;
-    g->player.alive = 1;
-    g->player.weapon = WEAPON_BASIC;
-    g->player.weapon_timer = 0;
-    g->player.shoot_cooldown = 0;
-
-    /* Timer du niveau */
-    g->time_left = LEVEL_TIME;
-    g->timer_ticks = 0;
-    g->countdown = 3;
-    g->countdown_ticks = 0;
-    g->state = STATE_COUNTDOWN;
-    g->current_level = level;
-
-    cx = PLAY_W / 2.0f;
-    cy = PLAY_TOP + 80.0f;
-
-    if (level == 5) {
-        /* ----- BOSS : un énorme gâteau ----- */
-        g->boss_alive = 1;
-        g->boss_hits  = 0;
-        g->boss_max_hits = 10;
-        Bubble *boss = &g->bubbles[0];
-        boss->x = cx - 60;
-        boss->y = (float)(PLAY_TOP + 40);
-        boss->vx = 2.0f;
-        boss->vy = 0.0f;
-        boss->radius = 60;
-        boss->level = 0;
-        boss->alive = 1;
-        boss->food = FOOD_CAKE;
-        boss->hits_needed = g->boss_max_hits;
-        boss->shoots_lightning = 1;
-        boss->lightning_timer = 80;
-        g->nb_bubbles = 1;
-        /* Le boss génère aussi 2 petites bulles */
-        add_bubble(g, cx - 120, cy, -2.5f, -4.0f, 0, FOOD_COOKIE);
-        add_bubble(g, cx + 60,  cy,  2.5f, -4.0f, 0, FOOD_BURGER);
-    } else {
-        /* Niveaux 1-4 : bulles normales */
-        int nb = 1 + level;      /* 2 à 5 grosses bulles */
-        int shoot_lightning = (level >= 3);
-        for (i = 0; i < nb; i++) {
-            float vx = rand_float(-3.0f, 3.0f);
-            if (fabsf(vx) < 1.0f) vx = 1.5f;
-            float vy = -rand_float(3.0f, 6.0f);
-            float x  = rand_float(60.0f, (float)(PLAY_W - 60));
-            Bubble *b;
-            add_bubble(g, x, cy, vx, vy, 0, food_for_level(level, i));
-            b = &g->bubbles[g->nb_bubbles - 1];
-            b->shoots_lightning = shoot_lightning && (i % 2 == 0);
-            b->lightning_timer  = 120 + rand() % 80;
+void asteroides_update(Asteroide **liste, int zone_w, int zone_h) {
+    Asteroide *a = *liste;
+    /* Gravite simulee */
+    float gravite = 0.15f;
+    while (a) {
+        a->vy += gravite;
+        a->x  += a->vx;
+        a->y  += a->vy;
+        /* Rebond horizontal */
+        if (a->x - a->rayon < 0) {
+            a->x  = a->rayon;
+            a->vx = fabsf(a->vx);
         }
-        g->boss_alive = 0;
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Mise à jour logique                                                  */
-/* ------------------------------------------------------------------ */
-
-void logic_update(GameData *g, int key_left, int key_right,
-                  int key_shoot, float dt)
-{
-    int i, j;
-    Player *pl = &g->player;
-    (void)dt;
-
-    g->frame++;
-
-    /* === COUNTDOWN === */
-    if (g->state == STATE_COUNTDOWN) {
-        g->countdown_ticks++;
-        if (g->countdown_ticks >= 60) {
-            g->countdown_ticks = 0;
-            g->countdown--;
-            if (g->countdown <= 0) g->state = STATE_PLAY;
-        }
-        return;
-    }
-
-    if (g->state != STATE_PLAY) return;
-
-    /* --- Timer du niveau --- */
-    g->timer_ticks++;
-    if (g->timer_ticks >= 60) {
-        g->timer_ticks = 0;
-        g->time_left--;
-        if (g->time_left <= 0) {
-            g->state = STATE_LEVEL_LOSE;
-            return;
-        }
-    }
-
-    /* --- Déplacement joueur --- */
-    if (!pl->alive) return;
-    if (key_left)  pl->x -= PLAYER_SPEED;
-    if (key_right) pl->x += PLAYER_SPEED;
-    if (pl->x < 0) pl->x = 0;
-    if (pl->x + PLAYER_W > PLAY_W) pl->x = (float)(PLAY_W - PLAYER_W);
-
-    /* Weapon timer */
-    if (pl->weapon != WEAPON_BASIC && pl->weapon_timer > 0) {
-        pl->weapon_timer--;
-        if (pl->weapon_timer == 0) pl->weapon = WEAPON_BASIC;
-    }
-    if (pl->shoot_cooldown > 0) pl->shoot_cooldown--;
-
-    /* --- Tir --- */
-    if (key_shoot && pl->shoot_cooldown == 0) {
-        int cooldown = (pl->weapon == WEAPON_DOUBLE) ? 8 : 14;
-        /* Cherche un slot libre */
-        int count = 0;
-        for (i = 0; i < MAX_PROJ; i++) {
-            if (g->projs[i].alive) count++;
-        }
-        /* Arme basique : 1 projectile max ; double : 2 max */
-        int max_proj = (pl->weapon == WEAPON_BASIC) ? 1 :
-                       (pl->weapon == WEAPON_DOUBLE) ? 2 : 3;
-        if (count < max_proj) {
-            /* tir central */
-            for (i = 0; i < MAX_PROJ; i++) {
-                if (!g->projs[i].alive) {
-                    g->projs[i].x = pl->x + PLAYER_W / 2.0f - PROJ_W / 2.0f;
-                    g->projs[i].y = pl->y - PROJ_H;
-                    g->projs[i].alive = 1;
-                    break;
-                }
-            }
-            /* tir large : second projectile décalé */
-            if (pl->weapon == WEAPON_WIDE) {
-                for (i = 0; i < MAX_PROJ; i++) {
-                    if (!g->projs[i].alive) {
-                        g->projs[i].x = pl->x + PLAYER_W - PROJ_W;
-                        g->projs[i].y = pl->y - PROJ_H;
-                        g->projs[i].alive = 1;
-                        break;
-                    }
-                }
-            }
-            pl->shoot_cooldown = cooldown;
-        }
-    }
-
-    /* --- Déplacement projectiles --- */
-    for (i = 0; i < MAX_PROJ; i++) {
-        if (!g->projs[i].alive) continue;
-        g->projs[i].y -= PROJ_SPEED;
-        if (g->projs[i].y + PROJ_H < PLAY_TOP)
-            g->projs[i].alive = 0;
-    }
-
-    /* --- Physique bulles --- */
-    for (i = 0; i < MAX_BUBBLES; i++) {
-        Bubble *b = &g->bubbles[i];
-        if (!b->alive) continue;
-
-        b->vy += GRAVITY;
-        b->x  += b->vx;
-        b->y  += b->vy;
-
-        /* Rebond murs gauche/droite */
-        if (b->x - b->radius < 0) {
-            b->x = (float)b->radius;
-            b->vx = fabsf(b->vx);
-        }
-        if (b->x + b->radius > PLAY_W) {
-            b->x = (float)(PLAY_W - b->radius);
-            b->vx = -fabsf(b->vx);
+        if (a->x + a->rayon > zone_w) {
+            a->x  = zone_w - a->rayon;
+            a->vx = -fabsf(a->vx);
         }
         /* Rebond sol */
-        if (b->y + b->radius >= PLAY_BOT) {
-            b->y  = (float)(PLAY_BOT - b->radius);
-            b->vy = -fabsf(b->vy) * BOUNCE_DAMP;
-            /* Mini rebond minimal pour éviter que la bulle reste au sol */
-            if (fabsf(b->vy) < 2.5f) b->vy = -4.5f;
+        if (a->y + a->rayon > zone_h) {
+            a->y  = zone_h - a->rayon;
+            a->vy = -fabsf(a->vy) * 0.9f;
         }
-        /* Rebond plafond */
-        if (b->y - b->radius < PLAY_TOP) {
-            b->y  = (float)(PLAY_TOP + b->radius);
-            b->vy = fabsf(b->vy) * 0.5f;
+        /* Plafond */
+        if (a->y - a->rayon < 0) {
+            a->y  = a->rayon;
+            a->vy = fabsf(a->vy);
         }
-
-        /* Boss : accélération progressive */
-        if (b->food == FOOD_CAKE && g->boss_hits > 0) {
-            float accel = 1.0f + 0.1f * g->boss_hits;
-            if (fabsf(b->vx) < 2.0f * accel) b->vx *= 1.001f;
-        }
-
-        /* Éclairs (niveaux 3+) */
-        if (b->shoots_lightning && b->alive) {
-            b->lightning_timer--;
-            if (b->lightning_timer <= 0) {
-                b->lightning_timer = 100 + rand() % 100;
-                /* Cherche slot éclair */
-                for (j = 0; j < 4; j++) {
-                    if (!g->lightnings[j].alive) {
-                        g->lightnings[j].x = b->x;
-                        g->lightnings[j].y = b->y + b->radius;
-                        g->lightnings[j].alive = 1;
-                        g->lightnings[j].timer = 60;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /* --- Déplacement éclairs --- */
-    for (i = 0; i < 4; i++) {
-        if (!g->lightnings[i].alive) continue;
-        g->lightnings[i].y += 5.0f;
-        g->lightnings[i].timer--;
-        if (g->lightnings[i].y > PLAY_BOT || g->lightnings[i].timer <= 0)
-            g->lightnings[i].alive = 0;
-
-        /* Collision éclair / joueur */
-        if (g->lightnings[i].alive && pl->alive) {
-            float lx = g->lightnings[i].x;
-            float ly = g->lightnings[i].y;
-            if (lx > pl->x - 8 && lx < pl->x + PLAYER_W + 8 &&
-                ly > pl->y && ly < pl->y + PLAYER_H) {
-                pl->alive = 0;
-                g->lightnings[i].alive = 0;
-                g->state = STATE_LEVEL_LOSE;
-                return;
-            }
-        }
-    }
-
-    /* --- Armes au sol --- */
-    for (i = 0; i < MAX_WEAPONS; i++) {
-        if (!g->weapons[i].alive) continue;
-        g->weapons[i].timer--;
-        if (g->weapons[i].timer <= 0) { g->weapons[i].alive = 0; continue; }
-        /* Récupération joueur */
-        if (pl->alive &&
-            g->weapons[i].x < pl->x + PLAYER_W &&
-            g->weapons[i].x + 20 > pl->x &&
-            g->weapons[i].y < pl->y + PLAYER_H &&
-            g->weapons[i].y + 20 > pl->y) {
-            pl->weapon = g->weapons[i].type;
-            pl->weapon_timer = 600; /* 10 secondes à 60fps */
-            g->weapons[i].alive = 0;
-        }
-    }
-
-    /* --- Collisions projectile / bulle --- */
-    for (i = 0; i < MAX_PROJ; i++) {
-        if (!g->projs[i].alive) continue;
-        for (j = 0; j < MAX_BUBBLES; j++) {
-            Bubble *b = &g->bubbles[j];
-            if (!b->alive) continue;
-            float dx = g->projs[i].x + PROJ_W / 2.0f - b->x;
-            float dy = g->projs[i].y - b->y;
-            float dist = sqrtf(dx * dx + dy * dy);
-            if (dist < (float)b->radius + PROJ_W / 2.0f) {
-                g->projs[i].alive = 0;
-
-                /* Boss : compter les touches */
-                if (b->food == FOOD_CAKE) {
-                    g->boss_hits++;
-                    g->score += 200;
-                    if (g->boss_hits >= g->boss_max_hits) {
-                        b->alive = 0;
-                        g->boss_alive = 0;
-                        g->nb_bubbles--;
-                        /* Victoire */
-                        int all_dead = 1;
-                        int k;
-                        for (k = 0; k < MAX_BUBBLES; k++)
-                            if (g->bubbles[k].alive) { all_dead = 0; break; }
-                        if (all_dead) { g->state = STATE_GAME_WIN; return; }
-                    }
-                    break;
-                }
-
-                /* Bulle normale : division */
-                b->hits_needed--;
-                if (b->hits_needed <= 0) {
-                    b->alive = 0;
-                    g->nb_bubbles--;
-                    g->score += (3 - b->level) * 100;
-
-                    /* Drop arme aléatoire (niveaux 2+, 20%) */
-                    if (g->current_level >= 2 && rand() % 5 == 0) {
-                        int k;
-                        for (k = 0; k < MAX_WEAPONS; k++) {
-                            if (!g->weapons[k].alive) {
-                                g->weapons[k].x = b->x;
-                                g->weapons[k].y = b->y;
-                                g->weapons[k].type = (WeaponType)(1 + rand() % 2);
-                                g->weapons[k].alive = 1;
-                                g->weapons[k].timer = 300;
-                                break;
-                            }
-                        }
-                    }
-
-                    /* Division en 2 bulles plus petites */
-                    if (b->level < BUBBLE_LEVELS - 1) {
-                        float spd = 3.0f + (float)(BUBBLE_LEVELS - b->level) * 0.5f;
-                        add_bubble(g, b->x, b->y, -spd, -5.0f, b->level + 1, b->food);
-                        add_bubble(g, b->x, b->y,  spd, -5.0f, b->level + 1, b->food);
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    /* --- Collision bulle / joueur --- */
-    for (i = 0; i < MAX_BUBBLES; i++) {
-        Bubble *b = &g->bubbles[i];
-        if (!b->alive || !pl->alive) continue;
-        float dx = b->x - (pl->x + PLAYER_W / 2.0f);
-        float dy = b->y - (pl->y + PLAYER_H / 2.0f);
-        float dist = sqrtf(dx * dx + dy * dy);
-        if (dist < (float)b->radius + PLAYER_W / 2.5f) {
-            pl->alive = 0;
-            g->state = STATE_LEVEL_LOSE;
-            return;
-        }
-    }
-
-    /* --- Victoire niveau : toutes les bulles mortes --- */
-    if (logic_all_bubbles_dead(g)) {
-        g->score += g->time_left * 10; /* bonus temps */
-        if (g->current_level == 5)
-            g->state = STATE_GAME_WIN;
-        else
-            g->state = STATE_LEVEL_WIN;
+        a = a->suivant;
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Requêtes                                                             */
-/* ------------------------------------------------------------------ */
+/* Insere un asteroide en tete de liste */
+static void liste_inserer(Asteroide **liste, Asteroide *a) {
+    a->suivant = *liste;
+    *liste = a;
+}
 
-int logic_all_bubbles_dead(const GameData *g)
-{
+void asteroide_diviser(Asteroide **liste, Asteroide *a,
+                        Bonus **liste_bonus) {
+    if (a->niveau_div >= 3) return; /* taille minimum : disparait */
+
+    int nouveau_rayon = a->rayon / 2;
+    int nouveau_div   = a->niveau_div + 1;
+    float speed_boost = 1.3f;
+
+    /* Fils gauche */
+    Asteroide *fils1 = asteroide_creer(
+        a->x, a->y,
+        -fabsf(a->vx) * speed_boost,
+        -fabsf(a->vy) * speed_boost,
+        nouveau_rayon, nouveau_div, a->lance_eclair, -1);
+    /* Fils droit */
+    Asteroide *fils2 = asteroide_creer(
+        a->x, a->y,
+        fabsf(a->vx) * speed_boost,
+        -fabsf(a->vy) * speed_boost,
+        nouveau_rayon, nouveau_div, a->lance_eclair, -1);
+
+    if (fils1) liste_inserer(liste, fils1);
+    if (fils2) liste_inserer(liste, fils2);
+
+    /* Faire tomber le bonus cache */
+    if (a->bonus_cache >= 0) {
+        Bonus *b = (Bonus*)malloc(sizeof(Bonus));
+        if (b) {
+            b->x     = a->x;
+            b->y     = a->y;
+            b->vy    = 2.0f;
+            b->type  = a->bonus_cache;
+            b->actif = 1;
+            b->suivant = *liste_bonus;
+            *liste_bonus = b;
+        }
+    }
+}
+
+void asteroides_vider(Asteroide **liste) {
+    Asteroide *a = *liste;
+    while (a) {
+        Asteroide *tmp = a->suivant;
+        free(a);
+        a = tmp;
+    }
+    *liste = NULL;
+}
+
+/* ============================================================
+   ECLAIRS
+   ============================================================ */
+Eclair* eclair_creer(float x, float y) {
+    Eclair *e = (Eclair*)malloc(sizeof(Eclair));
+    if (!e) return NULL;
+    e->x      = x;
+    e->y      = y;
+    e->vy     = 6;
+    e->actif  = 1;
+    e->suivant = NULL;
+    return e;
+}
+
+void eclairs_update(Eclair **liste, int zone_h) {
+    Eclair *e = *liste, *prev = NULL;
+    while (e) {
+        e->y += e->vy;
+        if (e->y > zone_h || !e->actif) {
+            Eclair *suivant = e->suivant;
+            if (prev) prev->suivant = suivant;
+            else       *liste       = suivant;
+            free(e);
+            e = suivant;
+        } else {
+            prev = e;
+            e    = e->suivant;
+        }
+    }
+}
+
+void eclairs_vider(Eclair **liste) {
+    Eclair *e = *liste;
+    while (e) {
+        Eclair *tmp = e->suivant;
+        free(e);
+        e = tmp;
+    }
+    *liste = NULL;
+}
+
+void asteroides_lancer_eclairs(Asteroide *liste, Eclair **eclairs) {
+    Asteroide *a = liste;
+    while (a) {
+        if (a->lance_eclair) {
+            a->timer_eclair--;
+            if (a->timer_eclair <= 0) {
+                Eclair *e = eclair_creer(a->x, a->y + a->rayon);
+                if (e) { e->suivant = *eclairs; *eclairs = e; }
+                a->timer_eclair = 120 + rand() % 180;
+            }
+        }
+        a = a->suivant;
+    }
+}
+
+/* ============================================================
+   BONUS
+   ============================================================ */
+void bonus_update(Bonus **liste, int zone_h) {
+    Bonus *b = *liste, *prev = NULL;
+    while (b) {
+        b->y += b->vy;
+        if (b->y > zone_h || !b->actif) {
+            Bonus *suivant = b->suivant;
+            if (prev) prev->suivant = suivant;
+            else       *liste       = suivant;
+            free(b);
+            b = suivant;
+        } else {
+            prev = b;
+            b    = b->suivant;
+        }
+    }
+}
+
+void bonus_vider(Bonus **liste) {
+    Bonus *b = *liste;
+    while (b) {
+        Bonus *tmp = b->suivant;
+        free(b);
+        b = tmp;
+    }
+    *liste = NULL;
+}
+
+/* ============================================================
+   BOSS
+   ============================================================ */
+void boss_init(Boss *b, int zone_w) {
+    b->x           = zone_w / 2 - 80;
+    b->y           = 40;
+    b->largeur     = 160;
+    b->hauteur     = 80;
+    b->hp_max      = 15;
+    b->hp_actuel   = 15;
+    b->vitesse_base = 1.5f;
+    b->vx          = b->vitesse_base;
+    b->vivant      = 1;
+    b->timer_spawn = 0;
+    b->frame_touche = 0;
+}
+
+void boss_update(Boss *b, int zone_w, Asteroide **asteroides) {
+    if (!b->vivant) return;
+
+    /* Vitesse augmente a chaque degat */
+    float vitesse = b->vitesse_base +
+                    (b->hp_max - b->hp_actuel) * 0.5f;
+    b->x += (b->vx > 0 ? vitesse : -vitesse);
+
+    if (b->x < 0)                       { b->x = 0;                b->vx = vitesse; }
+    if (b->x + b->largeur > zone_w)     { b->x = zone_w-b->largeur; b->vx = -vitesse; }
+
+    /* Flash degat */
+    if (b->frame_touche > 0) b->frame_touche--;
+
+    /* Spawn d'asteroides */
+    b->timer_spawn++;
+    if (b->timer_spawn >= 180) {
+        b->timer_spawn = 0;
+        float spawn_vx = (rand() % 2 == 0) ? 2.5f : -2.5f;
+        Asteroide *a = asteroide_creer(
+            b->x + b->largeur / 2, b->y + b->hauteur,
+            spawn_vx, 2.0f, RAYON_MOYEN, 1, 0, -1);
+        if (a) { a->suivant = *asteroides; *asteroides = a; }
+    }
+}
+
+/* ============================================================
+   COLLISIONS
+   ============================================================ */
+int collision_cercle_rect(float cx, float cy, int r,
+                           float rx, float ry, int rw, int rh) {
+    float closest_x = cx < rx ? rx : (cx > rx+rw ? rx+rw : cx);
+    float closest_y = cy < ry ? ry : (cy > ry+rh ? ry+rh : cy);
+    float dx = cx - closest_x;
+    float dy = cy - closest_y;
+    return (dx*dx + dy*dy) < (float)(r*r);
+}
+
+int collision_rect_rect(float x1, float y1, int w1, int h1,
+                         float x2, float y2, int w2, int h2) {
+    return !(x1+w1 < x2 || x2+w2 < x1 ||
+             y1+h1 < y2 || y2+h2 < y1);
+}
+
+void collisions_projectiles_asteroides(Projectile **projs,
+                                        Asteroide **asts,
+                                        Bonus **bonus,
+                                        int *score) {
+    Projectile *p = *projs;
+    while (p) {
+        if (!p->actif) { p = p->suivant; continue; }
+        Asteroide *a = *asts, *prev_a = NULL;
+        while (a) {
+            if (collision_cercle_rect(a->x, a->y, a->rayon,
+                                       p->x, p->y, 4, 12)) {
+                /* Supprimer l'asteroide */
+                if (prev_a) prev_a->suivant = a->suivant;
+                else         *asts          = a->suivant;
+                /* Points selon la taille */
+                *score += (4 - a->niveau_div) * 100;
+                /* Diviser si possible */
+                if (a->niveau_div < 3)
+                    asteroide_diviser(asts, a, bonus);
+                free(a);
+                a = (prev_a ? prev_a->suivant : *asts);
+                /* Desactiver le projectile */
+                p->actif = 0;
+                break;
+            } else {
+                prev_a = a;
+                a      = a->suivant;
+            }
+        }
+        p = p->suivant;
+    }
+}
+
+void collisions_projectiles_boss(Projectile **projs, Boss *b, int *score) {
+    if (!b->vivant) return;
+    Projectile *p = *projs;
+    while (p) {
+        if (p->actif && collision_rect_rect(p->x, p->y, 4, 12,
+                                             b->x, b->y,
+                                             b->largeur, b->hauteur)) {
+            p->actif = 0;
+            b->hp_actuel--;
+            b->frame_touche = 15;
+            *score += 500;
+            if (b->hp_actuel <= 0) { b->vivant = 0; *score += 5000; }
+        }
+        p = p->suivant;
+    }
+}
+
+void collisions_asteroide_joueur(Asteroide *asts, Joueur *j) {
+    if (!j->vivant || j->bouclier) return;
+    Asteroide *a = asts;
+    while (a) {
+        if (collision_cercle_rect(a->x, a->y, a->rayon,
+                                   j->x, j->y, j->largeur, j->hauteur))
+            j->vivant = 0;
+        a = a->suivant;
+    }
+}
+
+void collisions_eclair_joueur(Eclair *eclairs, Joueur *j) {
+    if (!j->vivant || j->bouclier) return;
+    Eclair *e = eclairs;
+    while (e) {
+        if (e->actif &&
+            collision_rect_rect(e->x-2, e->y, 4, 20,
+                                 j->x, j->y, j->largeur, j->hauteur))
+            j->vivant = 0;
+        e = e->suivant;
+    }
+}
+
+void collisions_boss_joueur(Boss *b, Joueur *j) {
+    if (!b->vivant || !j->vivant || j->bouclier) return;
+    if (collision_rect_rect(b->x, b->y, b->largeur, b->hauteur,
+                             j->x, j->y, j->largeur, j->hauteur))
+        j->vivant = 0;
+}
+
+void collisions_bonus_joueur(Bonus **bonus, Joueur *j) {
+    Bonus *b = *bonus;
+    while (b) {
+        if (b->actif &&
+            collision_rect_rect(b->x-10, b->y-10, 20, 20,
+                                 j->x, j->y, j->largeur, j->hauteur)) {
+            switch (b->type) {
+                case BONUS_LASER:
+                    j->arme_active = ARME_LASER;
+                    j->duree_arme  = 600;
+                    break;
+                case BONUS_BOMBE:
+                    j->arme_active = ARME_BOMBE;
+                    j->duree_arme  = 300;
+                    break;
+                case BONUS_BOUCLIER:
+                    j->bouclier = 300;
+                    break;
+            }
+            b->actif = 0;
+        }
+        b = b->suivant;
+    }
+}
+
+/* ============================================================
+   NIVEAU
+   ============================================================ */
+/* Placement initial des asteroides selon le numero de niveau */
+static void niveau_placer_asteroides(Niveau *n) {
+    int nb_gros   = 1 + n->numero;
+    int eclair    = (n->numero >= 3) ? 1 : 0;
+    int bonus_idx = 0;
     int i;
-    for (i = 0; i < MAX_BUBBLES; i++)
-        if (g->bubbles[i].alive) return 0;
+    for (i = 0; i < nb_gros; i++) {
+        float x  = 80 + (i * (JEU_LARG - 160) / nb_gros);
+        float y  = 80 + rand() % 100;
+        float vx = (rand() % 2 == 0) ? 2.0f + n->numero*0.3f
+                                     : -(2.0f + n->numero*0.3f);
+        float vy = 1.5f;
+        int   bc = (bonus_idx < 2) ? bonus_idx++ : -1;
+        Asteroide *a = asteroide_creer(x, y, vx, vy,
+                                        RAYON_GROS, 0, eclair, bc);
+        if (a) { a->suivant = n->liste_asteroides;
+                 n->liste_asteroides = a; }
+    }
+}
+
+void niveau_init(Niveau *n, int numero, Joueur *j) {
+    n->numero          = numero;
+    n->temps_restant   = 90 - (numero - 1) * 10;
+    n->timer_ticks     = 0;
+    n->score_courant   = 0;
+    n->boss_actif      = (numero == 4) ? 1 : 0;
+    n->liste_asteroides  = NULL;
+    n->liste_projectiles = NULL;
+    n->liste_bonus       = NULL;
+    n->liste_eclairs     = NULL;
+
+    joueur_init(j, j->pseudo);
+
+    if (!n->boss_actif)
+        niveau_placer_asteroides(n);
+    else
+        boss_init(&n->boss, JEU_LARG);
+}
+
+void niveau_update(Niveau *n, Joueur *j) {
+    /* Decompte temps */
+    n->timer_ticks++;
+    if (n->timer_ticks >= FPS) {
+        n->timer_ticks = 0;
+        n->temps_restant--;
+    }
+
+    /* Expiration arme */
+    if (j->duree_arme > 0) {
+        j->duree_arme--;
+        if (j->duree_arme == 0) j->arme_active = ARME_BASE;
+    }
+    /* Expiration bouclier */
+    if (j->bouclier > 0) j->bouclier--;
+
+    asteroides_update(&n->liste_asteroides, JEU_LARG, ZONE_JEU_H);
+    projectiles_update(&n->liste_projectiles);
+    bonus_update(&n->liste_bonus, ZONE_JEU_H);
+
+    if (n->numero >= 3)
+        asteroides_lancer_eclairs(n->liste_asteroides, &n->liste_eclairs);
+    eclairs_update(&n->liste_eclairs, ZONE_JEU_H);
+
+    if (n->boss_actif)
+        boss_update(&n->boss, JEU_LARG, &n->liste_asteroides);
+
+    /* Collisions */
+    collisions_projectiles_asteroides(&n->liste_projectiles,
+                                       &n->liste_asteroides,
+                                       &n->liste_bonus,
+                                       &n->score_courant);
+    if (n->boss_actif)
+        collisions_projectiles_boss(&n->liste_projectiles,
+                                     &n->boss, &n->score_courant);
+    collisions_asteroide_joueur(n->liste_asteroides, j);
+    collisions_eclair_joueur(n->liste_eclairs, j);
+    if (n->boss_actif) collisions_boss_joueur(&n->boss, j);
+    collisions_bonus_joueur(&n->liste_bonus, j);
+}
+
+void niveau_vider(Niveau *n) {
+    asteroides_vider(&n->liste_asteroides);
+    projectiles_vider(&n->liste_projectiles);
+    bonus_vider(&n->liste_bonus);
+    eclairs_vider(&n->liste_eclairs);
+}
+
+int niveau_gagne(Niveau *n) {
+    if (n->boss_actif) return !n->boss.vivant;
+    return (n->liste_asteroides == NULL);
+}
+
+int niveau_perdu(Niveau *n, Joueur *j) {
+    return (!j->vivant || n->temps_restant <= 0);
+}
+
+/* ============================================================
+   SAUVEGARDE
+   ============================================================ */
+int sauvegarde_ecrire(const char *pseudo, int niveau, int score) {
+    /* Lit toutes les sauvegardes, met a jour ou ajoute */
+    Sauvegarde sauves[64];
+    int nb = 0;
+    FILE *f = fopen(SAVE_FILE, "r");
+    if (f) {
+        while (nb < 64 &&
+               fscanf(f, "%31[^;];%d;%d\n",
+                      sauves[nb].pseudo,
+                      &sauves[nb].dernier_niveau,
+                      &sauves[nb].score) == 3)
+            nb++;
+        fclose(f);
+    }
+    /* Cherche si pseudo existe */
+    int idx = -1, i;
+    for (i = 0; i < nb; i++)
+        if (strcmp(sauves[i].pseudo, pseudo) == 0) { idx = i; break; }
+    if (idx < 0 && nb < 64) idx = nb++;
+    if (idx < 0) return 0;
+    strncpy(sauves[idx].pseudo, pseudo, PSEUDO_MAX-1);
+    sauves[idx].dernier_niveau = niveau;
+    sauves[idx].score          = score;
+    f = fopen(SAVE_FILE, "w");
+    if (!f) return 0;
+    for (i = 0; i < nb; i++)
+        fprintf(f, "%s;%d;%d\n", sauves[i].pseudo,
+                sauves[i].dernier_niveau, sauves[i].score);
+    fclose(f);
     return 1;
 }
 
-int logic_count_alive_bubbles(const GameData *g)
-{
-    int i, c = 0;
-    for (i = 0; i < MAX_BUBBLES; i++)
-        if (g->bubbles[i].alive) c++;
-    return c;
-}
-
-/* ------------------------------------------------------------------ */
-/* Sauvegarde                                                           */
-/* ------------------------------------------------------------------ */
-
-void logic_save(GameData *g)
-{
-    int i;
-    /* Mise à jour ou ajout */
-    int found = -1;
-    for (i = 0; i < g->nb_saves; i++) {
-        if (strcmp(g->saves[i].pseudo, g->player.pseudo) == 0) {
-            found = i; break;
+int sauvegarde_lire(const char *pseudo, Sauvegarde *s) {
+    FILE *f = fopen(SAVE_FILE, "r");
+    if (!f) return 0;
+    char buf_pseudo[PSEUDO_MAX];
+    int  niv, sc;
+    while (fscanf(f, "%31[^;];%d;%d\n", buf_pseudo, &niv, &sc) == 3) {
+        if (strcmp(buf_pseudo, pseudo) == 0) {
+            strncpy(s->pseudo, pseudo, PSEUDO_MAX-1);
+            s->dernier_niveau = niv;
+            s->score          = sc;
+            fclose(f);
+            return 1;
         }
     }
-    if (found == -1 && g->nb_saves < MAX_SAVES) {
-        found = g->nb_saves++;
-        strncpy(g->saves[found].pseudo, g->player.pseudo, PSEUDO_LEN - 1);
-    }
-    if (found >= 0) {
-        g->saves[found].level = g->current_level;
-        g->saves[found].score = g->score;
-    }
-
-    FILE *f = fopen(SAVE_FILE, "w");
-    if (!f) return;
-    for (i = 0; i < g->nb_saves; i++) {
-        fprintf(f, "%s %d %d\n",
-                g->saves[i].pseudo,
-                g->saves[i].level,
-                g->saves[i].score);
-    }
     fclose(f);
-}
-
-void logic_load_saves(GameData *g)
-{
-    FILE *f = fopen(SAVE_FILE, "r");
-    g->nb_saves = 0;
-    if (!f) return;
-    while (g->nb_saves < MAX_SAVES) {
-        SaveEntry *e = &g->saves[g->nb_saves];
-        if (fscanf(f, "%19s %d %d", e->pseudo, &e->level, &e->score) != 3)
-            break;
-        g->nb_saves++;
-    }
-    fclose(f);
-}
-
-int logic_find_save(GameData *g, const char *pseudo)
-{
-    int i;
-    for (i = 0; i < g->nb_saves; i++)
-        if (strcmp(g->saves[i].pseudo, pseudo) == 0) return i;
-    return -1;
+    return 0;
 }
